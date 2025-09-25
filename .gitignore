@@ -1,0 +1,14 @@
+# Large local data
+data/dataset.hdf5
+data/*.dcm
+outputs/*.npz
+outputs/*.npy
+outputs/*.jsonl
+
+# Notebooks / cache
+*.ipynb_checkpoints
+__pycache__/
+*.pyc
+
+# venv
+.venv*/
