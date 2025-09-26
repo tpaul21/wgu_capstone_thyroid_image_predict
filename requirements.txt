@@ -4,8 +4,8 @@
 # Core app
 streamlit>=1.37
 
-# ML stack (CPU wheels compatible with Python 3.13)
-torch==2.7.1+cpu
+# PyTorch CPU (Python 3.13 compatible pair)
+torch==2.7.0+cpu
 torchvision==0.22.0+cpu
 
 # Data & plotting (let pip pick Py3.13-compatible builds)
