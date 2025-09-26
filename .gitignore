@@ -12,3 +12,27 @@ __pycache__/
 
 # venv
 .venv*/
+
+# IDE and cache
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+*.ipynb_checkpoints
+
+# Virtual env
+.venv*/
+
+# Large data/artifacts (KEEP metrics JSONs)
+data/
+outputs/*.ckpt
+outputs/*.h5
+outputs/*.hdf5
+outputs/*.pt
+outputs/*_preds_*.csv
+outputs/*.npy
+outputs/*.npz
+outputs/*.jsonl
+
+# Streamlit cache
+.streamlit/
