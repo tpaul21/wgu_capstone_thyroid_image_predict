@@ -222,33 +222,29 @@ def make_splits_and_loaders_mm(
     frame_stride: int = 1,
     max_frames_per_group: Optional[int] = None,
     samples_per_epoch: Optional[int] = None,
-    # NEW: split fractions + malignant minimums (nodule-level)
+    # split fractions + malignant minimums (nodule-level)
     train_frac: float = 0.60,
     val_frac: float = 0.20,
     test_frac: float = 0.20,
     min_mal_val: int = 4,
     min_mal_test: int = 4,
-    ct: Optional[object] = None
+    # NEW: provide a fitted ColumnTransformer to reuse (no fitting)
+    ct: Optional[object] = None,
 ):
     """
-    Build train/val/test loaders with optional subsetting and capped-epoch sampling.
-
-    - subset_groups_frac: keep a random fraction of annot_id groups (e.g., 0.2)
-    - subset_groups_max:  keep at most N annot_id groups
-    - frame_stride:       within each annot_id, take every k-th frame (e.g., 5)
-    - max_frames_per_group: cap frames per annot_id (e.g., 10)
-    - samples_per_epoch:  if set, train_dl uses RandomSampler(replacement=True, num_samples=...)
-    - train/val/test fractions sum to 1.0 (nodule-level when annot_id is available)
-    - min_mal_val/test ensure at least this many malignant nodules in val/test (if available)
+    Build train/val/test loaders. If `ct` is provided (already fitted), it will be reused
+    to transform tabular features (no fitting inside this function). If `ct` is None,
+    image-only loaders are built (no tabular features).
     """
     import platform
+    import torch
     from sklearn.model_selection import train_test_split
-    from torch.utils.data import DataLoader, RandomSampler
+    from torch.utils.data import DataLoader, RandomSampler, Dataset
 
-    # 1) Read HDF5 minimal metadata and merge with CSV
+    # ------------------ 1) Read HDF5 & CSV; merge ------------------
     with h5py.File(HDF5_PATH, "r") as f:
-        df_h5 = _read_metadata_df(f)  # includes original h5_index (0..N-1), aligned to /image
-    df_h5 = df_h5.copy()  # keep name stable
+        df_h5 = _read_metadata_df(f)  # includes h5_index aligned to /image
+    df_h5 = df_h5.copy()
 
     if not CSV_PATH.exists():
         raise FileNotFoundError(
@@ -269,7 +265,7 @@ def make_splits_and_loaders_mm(
     if "h5_index" not in df.columns:
         df["h5_index"] = np.arange(len(df), dtype=np.int64)
 
-    # 2) Optional: dataset-level thinning by group and per-group frames
+    # ------------------ 2) Optional thinning by groups/frames ------------------
     if "annot_id" in df.columns:
         rng = np.random.RandomState(seed)
         groups_all = df["annot_id"].astype(str).unique()
@@ -285,7 +281,6 @@ def make_splits_and_loaders_mm(
         if (subset_groups_frac is not None) or (subset_groups_max is not None):
             df = df[df["annot_id"].astype(str).isin(set(keep_groups))].copy()
 
-        # Per-group frame thinning
         if frame_stride > 1 or (max_frames_per_group is not None):
             def _thin(g: pd.DataFrame) -> pd.DataFrame:
                 if "frame_num" in g.columns:
@@ -299,13 +294,12 @@ def make_splits_and_loaders_mm(
                 return g
 
             gb = df.groupby("annot_id", group_keys=False)
-            # pandas >= 2.2 supports include_groups; keep a fallback for older versions
             try:
                 df = gb.apply(_thin, include_groups=False).reset_index(drop=True)
             except TypeError:
                 df = gb.apply(_thin).reset_index(drop=True)
 
-    # 3) Labels -> {0,1} (aligned to CURRENT df row order)
+    # ------------------ 3) Labels -> {0,1} ------------------
     if HDF5_LABEL_COLUMN not in df.columns:
         raise KeyError(f"Label column '{HDF5_LABEL_COLUMN}' not found after merge.")
     labels_series = pd.Series(df[HDF5_LABEL_COLUMN]).map(LABEL_MAP)
@@ -314,20 +308,17 @@ def make_splits_and_loaders_mm(
         raise ValueError(f"Unmapped label values in {HDF5_LABEL_COLUMN}: {bad}")
     labels = labels_series.astype(np.int64).values
 
-    # Keep both row and h5 indices
     df = df.reset_index(drop=True)
-    df["row_idx"] = np.arange(len(df), dtype=np.int64)  # for X_all / labels
+    df["row_idx"] = np.arange(len(df), dtype=np.int64)
 
-    # 4) Split by annot_id groups when present (preferred), else frame-level fallback
+    # ------------------ 4) Grouped splits (by annot_id) or frame-level fallback ------------------
     if "annot_id" in df.columns:
         rng = np.random.RandomState(seed)
-        # one label per group (first occurrence)
         gtab = (df.groupby("annot_id")[HDF5_LABEL_COLUMN]
                   .first().map(LABEL_MAP).astype(int).rename("y")).reset_index()
         groups_all = gtab["annot_id"].astype(str).values
         y_all      = gtab["y"].values
 
-        # target split sizes (by NODULES)
         if abs((train_frac + val_frac + test_frac) - 1.0) > 1e-6:
             raise ValueError("train_frac + val_frac + test_frac must sum to 1.0")
         nG = len(groups_all)
@@ -335,27 +326,20 @@ def make_splits_and_loaders_mm(
         n_test  = max(1, int(round(nG * test_frac)))
         n_train = max(1, nG - n_val - n_test)
 
-        # malignant vs benign pools
         mal_groups = gtab.loc[gtab["y"] == 1, "annot_id"].astype(str).values
         ben_groups = gtab.loc[gtab["y"] == 0, "annot_id"].astype(str).values
-        rng.shuffle(mal_groups)
-        rng.shuffle(ben_groups)
+        rng.shuffle(mal_groups); rng.shuffle(ben_groups)
 
-        # desired malignant per split (respect minimums; clamp if not enough total)
         tgt_val_m  = max(min_mal_val,  int(round(len(mal_groups) * val_frac)))
         tgt_test_m = max(min_mal_test, int(round(len(mal_groups) * test_frac)))
         if tgt_val_m + tgt_test_m > len(mal_groups):
-            # balance as best as possible
             half = len(mal_groups) // 2
-            tgt_val_m  = max(min_mal_val, half)
-            tgt_test_m = len(mal_groups) - tgt_val_m
+            tgt_val_m, tgt_test_m = max(min_mal_val, half), len(mal_groups) - max(min_mal_val, half)
 
-        # allocate malignant first
-        val_m  = list(mal_groups[:tgt_val_m])
-        test_m = list(mal_groups[tgt_val_m:tgt_val_m + tgt_test_m])
+        val_m   = list(mal_groups[:tgt_val_m])
+        test_m  = list(mal_groups[tgt_val_m:tgt_val_m + tgt_test_m])
         train_m = list(mal_groups[tgt_val_m + tgt_test_m:])
 
-        # fill with benign to reach target sizes
         remain_val  = max(0, n_val  - len(val_m))
         remain_test = max(0, n_test - len(test_m))
         val_b  = list(ben_groups[:remain_val])
@@ -363,64 +347,39 @@ def make_splits_and_loaders_mm(
         ben_used = remain_val + remain_test
         train_b  = list(ben_groups[ben_used:])
 
-        g_val   = set(val_m + val_b)
-        g_test  = set(test_m + test_b)
-        g_train = set(train_m + train_b)
+        g_val, g_test, g_train = set(val_m + val_b), set(test_m + test_b), set(train_m + train_b)
 
-        # re-balance sizes to hit exact targets (prefer moving benign)
         def _move_some(src: set, dst: set, need: int):
             if need <= 0: return
-            # move benign first
-            src_ben = [g for g in src if g in set(train_b) or g in set(val_b) or g in set(test_b)]
-            move = src_ben[:need] if len(src_ben) >= need else list(src)[:need]
-            for m in move:
-                if m in src: src.remove(m)
-                dst.add(m)
+            src_list = list(src)
+            for m in src_list[:need]:
+                src.discard(m); dst.add(m)
 
-        # If val/test short, pull from train
-        if len(g_val) < n_val:  _move_some(g_train, g_val,  n_val - len(g_val))
+        if len(g_val) < n_val:   _move_some(g_train, g_val,  n_val - len(g_val))
         if len(g_test) < n_test: _move_some(g_train, g_test, n_test - len(g_test))
-        # If val/test long (shouldn't happen often), push extras back to train
-        if len(g_val) > n_val:  _move_some(g_val,  g_train, len(g_val)  - n_val)
+        if len(g_val) > n_val:   _move_some(g_val,  g_train, len(g_val)  - n_val)
         if len(g_test) > n_test: _move_some(g_test, g_train, len(g_test) - n_test)
-        # Final nudge if train is off due to rounding
-        if len(g_train) != n_train:
-            diff = len(g_train) - n_train
-            if diff > 0:
-                _move_some(g_train, g_val,  min(diff, n_val - len(g_val)))
-                _move_some(g_train, g_test, min(diff, n_test - len(g_test)))
-            elif diff < 0:
-                _move_some(g_val,  g_train, min(len(g_val),  -diff))
-                _move_some(g_test, g_train, min(len(g_test), -diff))
 
-        # Safety: no group leakage
-        assert len(g_train & g_val) == 0 and len(g_train & g_test) == 0 and len(g_val & g_test) == 0, \
-            "Group leakage detected."
+        assert len(g_train & g_val) == 0 and len(g_train & g_test) == 0 and len(g_val & g_test) == 0, "Group leakage detected."
 
-        # map groups to frame indices
         m_tr = df["annot_id"].astype(str).isin(g_train).values
         m_va = df["annot_id"].astype(str).isin(g_val).values
         m_te = df["annot_id"].astype(str).isin(g_test).values
 
-        # row indices (for X_all & labels)
         tr_rows = np.nonzero(m_tr)[0]
         va_rows = np.nonzero(m_va)[0]
         te_rows = np.nonzero(m_te)[0]
-        # h5 indices (for images)
-        tr_h5 = df.loc[m_tr, "h5_index"].values
-        va_h5 = df.loc[m_va, "h5_index"].values
-        te_h5 = df.loc[m_te, "h5_index"].values
+        tr_h5   = df.loc[m_tr, "h5_index"].values
+        va_h5   = df.loc[m_va, "h5_index"].values
+        te_h5   = df.loc[m_te, "h5_index"].values
 
     else:
-        # Fallback: frame-level stratified split on current df rows
         all_rows = np.arange(len(df))
         y = labels
-        # first split off (val+test)
         vt_size = val_frac + test_frac
         train_rows, tmp_rows, y_train, y_tmp = train_test_split(
             all_rows, y, test_size=vt_size, stratify=y, random_state=seed
         )
-        # now split tmp into val/test by their relative proportions
         val_ratio = val_frac / max(vt_size, 1e-8)
         val_rows, test_rows, y_val, y_test = train_test_split(
             tmp_rows, y_tmp, test_size=(1 - val_ratio), stratify=y_tmp, random_state=seed+1
@@ -428,38 +387,84 @@ def make_splits_and_loaders_mm(
         tr_rows, va_rows, te_rows = train_rows, val_rows, test_rows
         tr_h5   = df.loc[tr_rows, "h5_index"].values
         va_h5   = df.loc[va_rows, "h5_index"].values
-        te_h5   = df.loc[te_rows,  "h5_index"].values
+        te_h5   = df.loc[te_rows, "h5_index"].values
 
-    # 5) Tabular features: fit on train rows (current df), transform all current rows
-    df_train = df.iloc[tr_rows]
-    df_val   = df.iloc[va_rows]
-    df_test  = df.iloc[te_rows]
+    # ------------------ 5) Tabular transform (reuse CT or image-only) ------------------
+    feat_names: Optional[list] = None
+    X_all = None
+    tab_dim = 0
 
-    X_tr, X_va, X_te, ct, feat_names = fit_transform_all(df_train, df_val, df_test)
-    X_all = transform_all(df, ct)  # aligned to df row order (row_idx)
-    tab_dim = X_all.shape[1]
+    if ct is not None:
+        # Reuse provided transformer → transform current FULL df (keeps alignment)
+        X_all = transform_all(df, ct)  # must align with df row order
+        tab_dim = int(X_all.shape[1])
+        # Try to report feature names
+        try:
+            feat_names = list(ct.get_feature_names_out())
+        except Exception:
+            # fall back to saved list (optional)
+            try:
+                from project.config import OUT_DIR as _OD
+                p = _OD / "tab_feature_names.json"
+                if p.exists():
+                    feat_names = list(json.loads(p.read_text()))
+            except Exception:
+                feat_names = None
 
-    # --- Fit or reuse CT ---
+    # ------------------ 6) Minimal datasets (image-only or multimodal) ------------------
+    tf_train = _transforms(train=True)
+    tf_eval  = _transforms(train=False)
+
+    class _ImgOnlyDS(Dataset):
+        def __init__(self, rows, h5_idx, labels, train: bool):
+            self.rows = np.asarray(rows, dtype=np.int64)
+            self.h5_idx = np.asarray(h5_idx, dtype=np.int64)
+            self.labels = labels
+            self.tfms = tf_train if train else tf_eval
+
+        def __len__(self): return len(self.rows)
+
+        def __getitem__(self, i):
+            row = int(self.rows[i]); h5i = int(self.h5_idx[i])
+            with h5py.File(HDF5_PATH, "r") as f:
+                arr = f[HDF5_IMAGES_DATASET][h5i]
+            x = self.tfms(_to_pil_rgb(arr))
+            y = torch.tensor(self.labels[row], dtype=torch.float32)
+            return x, y
+
+    class _MMDs(Dataset):
+        def __init__(self, rows, h5_idx, labels, X_all, train: bool):
+            self.rows = np.asarray(rows, dtype=np.int64)
+            self.h5_idx = np.asarray(h5_idx, dtype=np.int64)
+            self.labels = labels
+            self.X_all = X_all
+            self.tfms = tf_train if train else tf_eval
+
+        def __len__(self): return len(self.rows)
+
+        def __getitem__(self, i):
+            row = int(self.rows[i]); h5i = int(self.h5_idx[i])
+            with h5py.File(HDF5_PATH, "r") as f:
+                arr = f[HDF5_IMAGES_DATASET][h5i]
+            x_img = self.tfms(_to_pil_rgb(arr))
+            x_tab = torch.tensor(self.X_all[row], dtype=torch.float32)
+            y = torch.tensor(self.labels[row], dtype=torch.float32)
+            return x_img, x_tab, y
+
     if ct is None:
-        # Status quo path: fit on the training split and transform all splits
-        X_train, X_val, X_test, ct = fit_transform_all(
-            df_train, df_val, df_test
-        )
+        # image-only
+        train_ds = _ImgOnlyDS(tr_rows, tr_h5, labels, train=True)
+        val_ds   = _ImgOnlyDS(va_rows, va_h5, labels, train=False)
+        test_ds  = _ImgOnlyDS(te_rows, te_h5, labels, train=False)
+        tab_dim  = 0
+        feat_names = None
     else:
-        # Reuse the provided transformer (this keeps tab_dim identical to the checkpoint)
-        X_train = transform_all(df_train, ct)
-        X_val   = transform_all(df_val, ct)
-        X_test  = transform_all(df_test, ct)
+        # multimodal
+        train_ds = _MMDs(tr_rows, tr_h5, labels, X_all, train=True)
+        val_ds   = _MMDs(va_rows, va_h5, labels, X_all, train=False)
+        test_ds  = _MMDs(te_rows, te_h5, labels, X_all, train=False)
 
-    tab_dim = X_train.shape[1]
-
-    # 6) Build datasets using BOTH row_indices and h5_indices (dual-index to avoid X_tab misalignment)
-    train_ds = H5ThyroidDatasetMM(tr_rows, tr_h5, labels, X_all, train=True)
-    val_ds   = H5ThyroidDatasetMM(va_rows, va_h5, labels, X_all, train=False)
-    test_ds  = H5ThyroidDatasetMM(te_rows, te_h5, labels, X_all, train=False)
-
-    # 7) Loaders (optionally capped per-epoch)
-    # Prefer config knobs if present; else fall back to safe defaults
+    # ------------------ 7) DataLoaders ------------------
     try:
         from project.config import NUM_WORKERS as _NW, PIN_MEMORY as _PM
         num_workers = _NW
@@ -483,4 +488,5 @@ def make_splits_and_loaders_mm(
                          num_workers=num_workers, pin_memory=pin_memory)
 
     return train_dl, val_dl, test_dl, ct, feat_names, tab_dim
+
 
