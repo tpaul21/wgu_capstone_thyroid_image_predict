@@ -215,7 +215,7 @@ class H5ThyroidDatasetMM(Dataset):
 
 # ----------------- loaders -----------------
 def make_splits_and_loaders_mm(
-    batch_size: int,
+    batch_size: int = 32,
     seed: int = 42,
     subset_groups_frac: Optional[float] = None,
     subset_groups_max: Optional[int] = None,
@@ -228,6 +228,7 @@ def make_splits_and_loaders_mm(
     test_frac: float = 0.20,
     min_mal_val: int = 4,
     min_mal_test: int = 4,
+    ct: Optional[object] = None
 ):
     """
     Build train/val/test loaders with optional subsetting and capped-epoch sampling.
@@ -437,6 +438,20 @@ def make_splits_and_loaders_mm(
     X_tr, X_va, X_te, ct, feat_names = fit_transform_all(df_train, df_val, df_test)
     X_all = transform_all(df, ct)  # aligned to df row order (row_idx)
     tab_dim = X_all.shape[1]
+
+    # --- Fit or reuse CT ---
+    if ct is None:
+        # Status quo path: fit on the training split and transform all splits
+        X_train, X_val, X_test, ct = fit_transform_all(
+            df_train, df_val, df_test
+        )
+    else:
+        # Reuse the provided transformer (this keeps tab_dim identical to the checkpoint)
+        X_train = transform_all(df_train, ct)
+        X_val   = transform_all(df_val, ct)
+        X_test  = transform_all(df_test, ct)
+
+    tab_dim = X_train.shape[1]
 
     # 6) Build datasets using BOTH row_indices and h5_indices (dual-index to avoid X_tab misalignment)
     train_ds = H5ThyroidDatasetMM(tr_rows, tr_h5, labels, X_all, train=True)
