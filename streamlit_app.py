@@ -414,6 +414,14 @@ if "threshold_value" not in st.session_state or "threshold_source" not in st.ses
     st.session_state["threshold_value"] = float(_thr)
     st.session_state["threshold_source"] = _src
 
+uploaded = st.sidebar.file_uploader(
+    "Upload an image (PNG/JPG/JPEG/DICOM)",
+    type=["png", "jpg", "jpeg", "dcm"],
+    key="case_uploader",
+)
+if uploaded is None:
+    st.sidebar.caption("…or browse the dataset below.")
+
 threshold = st.sidebar.slider(
     "Decision Threshold (malignant)",
     0.0, 1.0, float(st.session_state["threshold_value"]), 0.001, format="%.3f", key="threshold_value"
@@ -458,7 +466,7 @@ else:
 case_index = st.sidebar.number_input(
     "Dataset Index (after filter/search)", min_value=0, value=default_idx, step=1
 )
-uploaded = st.sidebar.file_uploader("Or upload an image", type=["png","jpg","jpeg","dcm"])
+
 
 # ---------------- Tabs ----------------
 tab_overview, tab_performance, tab_case = st.tabs(["📊 Overview", "📈 Performance", "🔍 Case Explorer"])
