@@ -16,7 +16,7 @@ from sklearn.pipeline import Pipeline
 # ---------------------------------------------------------------------
 TAB_NUM: List[str] = [
     "age",
-    "size_x", "size_y", "size_z",       # lesion dimensions
+    "size_x", "size_y", "size_z",  # lesion dimensions
 ]
 
 TAB_CAT: List[str] = [
@@ -34,8 +34,6 @@ TAB_CAT: List[str] = [
 _EXCLUDE_ALWAYS = {
     "histopath_diagnosis",  # the label
     "label",                # any derived label column
-    # Add any known post-biopsy or outcome columns here if present in your CSV
-    # e.g., "post_biopsy_treatment", "surgery_outcome", etc.
 }
 
 # ---------------------------------------------------------------------
@@ -96,9 +94,9 @@ def _build_ct(num_cols: List[str], cat_cols: List[str]) -> ColumnTransformer:
         n_jobs=None,
         verbose_feature_names_out=False,  # cleaner names
     )
-    # Keep track of the columns actually used (for robust single-row transform)
-    ct.mm_num_cols = num_cols
-    ct.mm_cat_cols = cat_cols
+    # Keep track of the columns actually used (for robust transforms later)
+    ct.mm_num_cols = list(num_cols)
+    ct.mm_cat_cols = list(cat_cols)
     return ct
 
 def _get_feature_names(ct: ColumnTransformer) -> List[str]:
@@ -108,18 +106,14 @@ def _get_feature_names(ct: ColumnTransformer) -> List[str]:
         if name == "remainder" and trans == "drop":
             continue
         if name == "num":
-            # StandardScaler keeps column names
             names.extend(list(cols))
         elif name == "cat":
-            # Pull names from the OHE inside the pipeline
             ohe = trans.named_steps.get("ohe")
             if hasattr(ohe, "get_feature_names_out"):
                 names.extend(list(ohe.get_feature_names_out(cols)))
             else:
-                # older sklearn
                 names.extend(list(ohe.get_feature_names(cols)))
         else:
-            # Fallback: append raw column names
             names.extend(list(cols))
     return names
 
@@ -133,6 +127,23 @@ def _coerce_dtypes(df: pd.DataFrame, num_cols: Sequence[str], cat_cols: Sequence
         if c in dfc.columns:
             dfc[c] = dfc[c].astype(str)
     return dfc
+
+def _extract_mm_cols_from_ct(maybe_ct) -> Tuple[Optional[List[str]], Optional[List[str]]]:
+    """
+    Try to recover the numeric/categorical column lists the CT was fit on.
+    Works if:
+      - ct has .mm_num_cols/.mm_cat_cols (ours), OR
+      - ct is a wrapper with inner CT on attribute .ct that has those.
+    Returns (num_cols, cat_cols) or (None, None) if unavailable.
+    """
+    for obj in (maybe_ct, getattr(maybe_ct, "ct", None)):
+        if obj is None:
+            continue
+        num = getattr(obj, "mm_num_cols", None)
+        cat = getattr(obj, "mm_cat_cols", None)
+        if isinstance(num, (list, tuple)) and isinstance(cat, (list, tuple)):
+            return list(num), list(cat)
+    return None, None
 
 # ---------------------------------------------------------------------
 # Public API
@@ -169,42 +180,44 @@ def fit_transform_all(
     X_te = X_te.astype(np.float32, copy=False)
     return X_tr, X_va, X_te, ct, feat_names
 
-def transform_all(df: pd.DataFrame, ct: ColumnTransformer) -> np.ndarray:
+def transform_all(df: pd.DataFrame, ct) -> np.ndarray:
     """
-    Transform an arbitrary DataFrame with an already-fitted ColumnTransformer.
-    Uses the exact numeric/categorical columns ct was fit on (ct.mm_num_cols / ct.mm_cat_cols).
+    Transform an arbitrary DataFrame with an already-fitted ColumnTransformer or a wrapper
+    exposing .transform(df). We prefer the exact numeric/categorical columns the CT was fit on.
+    If those are not discoverable, we fall back to the whitelisted TAB_NUM/TAB_CAT present in df.
     Returns float32 numpy array [N, D].
     """
-    if not hasattr(ct, "mm_num_cols") or not hasattr(ct, "mm_cat_cols"):
-        raise AttributeError("ColumnTransformer is missing mm_num_cols/mm_cat_cols. "
-                             "Use the ct returned by fit_transform_all().")
-    num_cols: List[str] = list(ct.mm_num_cols)
-    cat_cols: List[str] = list(ct.mm_cat_cols)
+    # Try to recover the exact columns the CT expects
+    num_cols, cat_cols = _extract_mm_cols_from_ct(ct)
 
-    # Build a projection DataFrame with just the columns ct expects; missing cols become NaN
+    if num_cols is None or cat_cols is None:
+        # Fallback: use the whitelist intersected with df (safe because CT will ignore unknowns via column names)
+        avail_num, avail_cat = _select_available_columns(df)
+        num_cols = avail_num
+        cat_cols = avail_cat
+
+    # Build a projection DataFrame with just the columns we want; missing cols become NaN
     data = {}
     for c in num_cols:
-        data[c] = pd.to_numeric(df.get(c, pd.Series([np.nan]*len(df))), errors="coerce")
+        data[c] = pd.to_numeric(df.get(c, pd.Series([np.nan] * len(df))), errors="coerce")
     for c in cat_cols:
-        s = df.get(c, pd.Series([np.nan]*len(df)))
+        s = df.get(c, pd.Series([np.nan] * len(df)))
         data[c] = s.astype(str)
 
     dfx = pd.DataFrame(data, index=df.index)
     X = ct.transform(dfx).astype(np.float32, copy=False)
     return X
 
-def transform_single_row(row: pd.Series | Dict[str, Any], ct: ColumnTransformer) -> np.ndarray:
+def transform_single_row(row: pd.Series | Dict[str, Any], ct) -> np.ndarray:
     """
-    Transform a single row (Series or dict-like) into a 2D feature array [1, D].
-    Only the ct.mm_num_cols and ct.mm_cat_cols are used.
-    Missing values are imputed by the pipeline.
+    Transform a single row (Series or dict-like) with an already-fitted CT or wrapper.
+    Only the CT's expected columns are used when available; otherwise falls back to the whitelist.
+    Returns [1, D] float32 array.
     """
-    if not hasattr(ct, "mm_num_cols") or not hasattr(ct, "mm_cat_cols"):
-        raise AttributeError("ColumnTransformer is missing mm_num_cols/mm_cat_cols. "
-                             "Use the ct returned by fit_transform_all().")
-
-    num_cols: List[str] = list(ct.mm_num_cols)
-    cat_cols: List[str] = list(ct.mm_cat_cols)
+    num_cols, cat_cols = _extract_mm_cols_from_ct(ct)
+    if num_cols is None or cat_cols is None:
+        # Fallback to whitelist order
+        num_cols, cat_cols = list(TAB_NUM), list(TAB_CAT)
 
     # Normalize input -> DataFrame with exactly the expected columns
     if isinstance(row, pd.Series):
