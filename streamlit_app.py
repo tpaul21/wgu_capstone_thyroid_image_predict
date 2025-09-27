@@ -1,7 +1,7 @@
 # File: project/streamlit_app.py
 from __future__ import annotations
 import io
-import os as _os
+import os 
 _os.environ.setdefault("OMP_NUM_THREADS", "1")
 _os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 _os.environ.setdefault("MKL_NUM_THREADS", "1")
