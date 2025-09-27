@@ -504,60 +504,106 @@ with tab_performance:
         st.rerun()
 
 
-    res = load_model_and_kind()
-    if res.get("status") == "ok":
-        model, kind, _ = res["model"], res["kind"], res["tab_dim"]
-    
-    elif res.get("status") == "dim_mismatch":
-        st.error(
-            "Tabular feature dimension mismatch: transformer outputs "
-            f"{res['ct_dim']} features, but checkpoint expects {res['ckpt_dim']}."
-        )
-        st.caption(
-            "This usually means the saved transformer does not match the checkpoint. "
-            "Ensure OUT_DIR contains the matching `tab_transformer.joblib` that was "
-            "saved at the same time as the checkpoint."
-        )
-        st.write(f"**Checkpoint:** `{os.path.basename(res['ckpt_path'])}`")
-        st.write(f"**Transformer:** `{os.path.basename(res['ct_path'])}`")
-    
-        c1, c2 = st.columns(2)
-        if c1.button("Reset caches and rerun"):
-            st.cache_data.clear()
-            st.cache_resource.clear()
-            st.rerun()
-        if c2.button("Fallback to image-only for this session"):
-            img_ckpt = OUT_DIR / "best_resnet18_hdf5.ckpt"
-            if img_ckpt.exists():
-                m = build_resnet18()
-                m.load_state_dict(torch.load(img_ckpt, map_location="cpu"))
-                m.eval()
-                model, kind, _ = m, "img", 0
-                st.success("Loaded image-only model for this session.")
-            else:
-                st.warning("Image-only checkpoint not found.")
-                st.stop()
-    
-        # ⬇️ Do not proceed unless a model was set above
-        if "model" not in locals():
+    # ---- Load model (same logic you had) -----------------------------------------
+res = load_model_and_kind()
+if res.get("status") == "ok":
+    model, kind, tab_dim_from_ckpt = res["model"], res["kind"], res["tab_dim"]
+
+elif res.get("status") == "dim_mismatch":
+    st.error(
+        "Tabular feature dimension mismatch: transformer outputs "
+        f"{res['ct_dim']} features, but checkpoint expects {res['ckpt_dim']}."
+    )
+    st.caption(
+        "This usually means the saved transformer does not match the checkpoint. "
+        "Ensure OUT_DIR contains the matching `tab_transformer.joblib` and "
+        "`tab_feature_names.json` that were saved with this checkpoint."
+    )
+    st.write(f"**Checkpoint:** `{os.path.basename(res['ckpt_path'])}`")
+    st.write(f"**Transformer:** `{os.path.basename(res['ct_path'])}`")
+
+    c1, c2 = st.columns(2)
+    if c1.button("Reset caches and rerun"):
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.rerun()
+    if c2.button("Fallback to image-only for this session"):
+        img_ckpt = OUT_DIR / "best_resnet18_hdf5.ckpt"
+        if img_ckpt.exists():
+            m = build_resnet18()
+            m.load_state_dict(torch.load(img_ckpt, map_location="cpu"))
+            m.eval()
+            model, kind, tab_dim_from_ckpt = m, "img", 0
+            st.success("Loaded image-only model for this session.")
+        else:
+            st.warning("Image-only checkpoint not found.")
             st.stop()
-    
-    else:
-        st.warning("No trained checkpoints found. Train a model first: `python -m project.train_hdf5_mm`.")
+
+    # Do not proceed unless a model was set above
+    if "model" not in locals():
         st.stop()
 
+else:
+    st.warning("No trained checkpoints found. Train a model first: `python -m project.train_hdf5_mm`.")
+    st.stop()
 
-    
-    train_dl, val_dl, test_dl, _, _, _ = make_splits_and_loaders_mm(batch_size=16)
+# ---- Build loaders with the SAVED ColumnTransformer when multimodal ----------
+# This is the critical part that prevents tab-dimension mismatches.
+ct_saved = load_tab_transformer() if kind == "mm" else None
+if kind == "mm" and ct_saved is None:
+    st.error(
+        "Multimodal checkpoint detected, but `outputs/tab_transformer.joblib` "
+        "was not found. Please commit that file (and `tab_feature_names.json`) "
+        "from the training run that produced this checkpoint."
+    )
+    st.stop()
 
-    # Build pos_weight from train labels
-    ys = []
-    for batch in train_dl:
-        y = batch[-1]
-        ys.append(y.numpy())
-    y_concat = np.concatenate(ys) if ys else np.array([0,1])
-    pos, neg = int(y_concat.sum()), int((1 - y_concat).sum())
-    criterion = make_criterion(pos, neg, device=torch.device("cpu"))
+try:
+    # Always call the same loader function. It will:
+    #  - reuse `ct_saved` if provided (mm path), keeping tab_dim consistent
+    #  - behave as before if image-only (ct=None)
+    train_dl, val_dl, test_dl, _, _, tab_dim_from_loader = make_splits_and_loaders_mm(
+        batch_size=16,
+        ct=ct_saved,
+    )
+
+    # Sanity-check: if this is multimodal, loader tab_dim should match the ckpt's tab_dim
+    if kind == "mm" and tab_dim_from_loader != tab_dim_from_ckpt:
+        st.warning(
+            f"Tabular feature width from loader ({tab_dim_from_loader}) does not match "
+            f"checkpoint expectation ({tab_dim_from_ckpt}). "
+            "This suggests the committed transformer or feature-name list doesn't correspond "
+            "to the checkpoint. Make sure both `tab_transformer.joblib` and "
+            "`tab_feature_names.json` were saved with this checkpoint and are present in `outputs/`."
+        )
+
+except RuntimeError as e:
+    # Catch shape errors (e.g., mat1 x mat2 cannot be multiplied) and guide recovery
+    st.error(
+        "Failed to prepare evaluation loaders due to a shape mismatch while applying the "
+        "tabular transformer. This almost always means the saved transformer does not match "
+        "the checkpoint's expected feature layout."
+    )
+    st.exception(e)
+    st.caption(
+        "Fix by committing the exact pair from training: "
+        "`outputs/tab_transformer.joblib` and `outputs/tab_feature_names.json` "
+        "that were produced together with this checkpoint."
+    )
+    st.stop()
+
+# ---- Build pos_weight and criterion (unchanged) ------------------------------
+ys = []
+for batch in train_dl:
+    y = batch[-1]  # last element is labels for both 2- or 3-tuple batches
+    ys.append(y.numpy())
+y_concat = np.concatenate(ys) if ys else np.array([0, 1])
+pos, neg = int(y_concat.sum()), int((1 - y_concat).sum())
+criterion = make_criterion(pos, neg, device=torch.device("cpu"))
+
+# ---- Now you can safely evaluate (your existing code below can remain) -------
+metrics = evaluate(model, test_dl, criterion, torch.device("cpu"))
+
 
     metrics = evaluate(model, test_dl, criterion, torch.device("cpu"))
 
