@@ -17,7 +17,10 @@ from datetime import datetime, timezone
 from project.utils_hash import verify_hash
 
 from project.config import (
-    HDF5_PATH, HDF5_IMAGES_DATASET, HDF5_LABEL_COLUMN, LABEL_MAP, OUT_DIR
+    HDF5_PATH, HDF5_IMAGES_DATASET, HDF5_LABEL_COLUMN, LABEL_MAP, OUT_DIR, SEED,
+    SUBSET_GROUPS_FRAC, SUBSET_GROUPS_MAX,
+    FRAME_STRIDE, MAX_FRAMES_PER_GROUP,
+    SAMPLES_PER_EPOCH,
 )
 from project.data_hdf5 import _to_pil_rgb, _transforms, _read_metadata_df, make_splits_and_loaders_mm
 from project.model import build_resnet18, build_multimodal_resnet
@@ -543,6 +546,7 @@ with tab_performance:
         st.warning("No trained checkpoints found. Train a model first: `python -m project.train_hdf5_mm`.")
         st.stop()
 
+    
     # ---- Prepare the EXACT transformer used for the checkpoint -----------------
     ct_saved = None
     if kind == "mm":
@@ -554,7 +558,7 @@ with tab_performance:
                 "from the same training run as this checkpoint."
             )
             st.stop()
-
+    
         # 1) Measure raw CT dim
         dummy = pd.DataFrame([{c: np.nan for c in (TAB_NUM + TAB_CAT)}])
         try:
@@ -563,12 +567,12 @@ with tab_performance:
             st.error("The saved transformer failed on a dummy row; it likely doesn't match your current features.")
             st.exception(e)
             st.stop()
-
+    
         # 2) If we have expected names, align order/width to match them
         exp_names = _load_expected_feature_names() or []
         cur_names = _get_feature_names(ct_saved)
         needs_align = bool(exp_names) and (cur_names is None or exp_names != list(cur_names))
-
+    
         if needs_align:
             ct_saved = _FeatureAligner(ct_saved, expected_names=exp_names, current_names=cur_names or [])
             try:
@@ -579,7 +583,7 @@ with tab_performance:
                 st.stop()
         else:
             ct_dim_aligned = ct_dim_raw
-
+    
         # 3) Hard check vs checkpoint expectation
         if ct_dim_aligned != tab_dim_from_ckpt:
             st.error(
@@ -605,6 +609,123 @@ with tab_performance:
                     st.stop()
             else:
                 st.stop()
+
+# ---- Build loaders using the chosen transformer (or None for image-only) ----
+# ---- Prepare the EXACT transformer used for the checkpoint -----------------
+ct_saved = None
+if kind == "mm":
+    ct_saved = load_tab_transformer()
+    if ct_saved is None:
+        st.error(
+            "Multimodal checkpoint detected, but `outputs/tab_transformer.joblib` "
+            "was not found. Please commit that file (and `tab_feature_names.json`) "
+            "from the same training run as this checkpoint."
+        )
+        st.stop()
+
+    # 1) Measure raw CT dim
+    dummy = pd.DataFrame([{c: np.nan for c in (TAB_NUM + TAB_CAT)}])
+    try:
+        ct_dim_raw = int(ct_saved.transform(dummy).shape[1])
+    except Exception as e:
+        st.error("The saved transformer failed on a dummy row; it likely doesn't match your current features.")
+        st.exception(e)
+        st.stop()
+
+    # 2) If we have expected names, align order/width to match them
+    exp_names = _load_expected_feature_names() or []
+    cur_names = _get_feature_names(ct_saved)
+    needs_align = bool(exp_names) and (cur_names is None or exp_names != list(cur_names))
+
+    if needs_align:
+        ct_saved = _FeatureAligner(ct_saved, expected_names=exp_names, current_names=cur_names or [])
+        try:
+            ct_dim_aligned = int(ct_saved.transform(dummy).shape[1])
+        except Exception as e:
+            st.error("Feature alignment wrapper failed to transform a dummy row.")
+            st.exception(e)
+            st.stop()
+    else:
+        ct_dim_aligned = ct_dim_raw
+
+    # 3) Hard check vs checkpoint expectation
+    if ct_dim_aligned != tab_dim_from_ckpt:
+        st.error(
+            f"Tabular feature width from transformer ({ct_dim_aligned}) does not match "
+            f"checkpoint expectation ({tab_dim_from_ckpt})."
+        )
+        st.caption(
+            "This means the committed transformer/feature-name list doesn't correspond to the checkpoint. "
+            "Commit the exact pair from training: `outputs/tab_transformer.joblib` and "
+            "`outputs/tab_feature_names.json` that were produced together with this checkpoint."
+        )
+        # Offer a safe fallback so you can still see plots
+        if st.button("Use image-only fallback for Performance only"):
+            img_ckpt = OUT_DIR / "best_resnet18_hdf5.ckpt"
+            if img_ckpt.exists():
+                m = build_resnet18()
+                m.load_state_dict(torch.load(img_ckpt, map_location="cpu"))
+                m.eval()
+                model, kind, tab_dim_from_ckpt, ct_saved = m, "img", 0, None
+                st.success("Switched to image-only for this session.")
+            else:
+                st.warning("Image-only checkpoint not found.")
+                st.stop()
+        else:
+            st.stop()
+
+# ---- Build loaders using the chosen transformer (or None for image-only) ----
+try:
+    # IMPORTANT: pass the training knobs from config.py so Cloud matches your training run
+    train_dl, val_dl, test_dl, _, _, tab_dim_from_loader = make_splits_and_loaders_mm(
+        batch_size=16,
+        seed=SEED,
+        subset_groups_frac=SUBSET_GROUPS_FRAC,
+        subset_groups_max=SUBSET_GROUPS_MAX,
+        frame_stride=FRAME_STRIDE,
+        max_frames_per_group=MAX_FRAMES_PER_GROUP,
+        samples_per_epoch=SAMPLES_PER_EPOCH,
+        ct=ct_saved,   # None if image-only; exact/aligned CT if multimodal
+    )
+
+    if kind == "mm" and tab_dim_from_loader != tab_dim_from_ckpt:
+        st.error(
+            f"Loader produced tab width {tab_dim_from_loader}, but checkpoint expects {tab_dim_from_ckpt}. "
+            "This indicates a transformer / feature-name mismatch. Please commit the correct "
+            "`tab_transformer.joblib` + `tab_feature_names.json` pair for this checkpoint."
+        )
+        st.stop()
+
+    # Small diagnostic so you can see the evaluated split sizes & tab width
+    st.caption(
+        f"Eval split (frame-level): train={len(train_dl.dataset)}, "
+        f"val={len(val_dl.dataset)}, test={len(test_dl.dataset)} frames • "
+        f"tab_dim={tab_dim_from_loader}"
+    )
+
+except RuntimeError as e:
+    st.error(
+        "Failed preparing evaluation loaders due to a shape mismatch while applying the tabular transformer."
+    )
+    st.exception(e)
+    st.caption(
+        "Fix by committing the exact pair from training: "
+        "`outputs/tab_transformer.joblib` and `outputs/tab_feature_names.json`."
+    )
+    st.stop()
+
+
+except RuntimeError as e:
+    st.error(
+        "Failed preparing evaluation loaders due to a shape mismatch while applying the tabular transformer."
+    )
+    st.exception(e)
+    st.caption(
+        "Fix by committing the exact pair from training: "
+        "`outputs/tab_transformer.joblib` and `outputs/tab_feature_names.json`."
+    )
+    st.stop()
+
 
     # ---- Build loaders using the chosen transformer (or None for image-only) ----
     try:
