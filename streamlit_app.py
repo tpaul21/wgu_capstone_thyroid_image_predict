@@ -2,9 +2,9 @@
 from __future__ import annotations
 import io
 import os as _os
-    _os.environ.setdefault("OMP_NUM_THREADS", "1")
-    _os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-    _os.environ.setdefault("MKL_NUM_THREADS", "1")
+_os.environ.setdefault("OMP_NUM_THREADS", "1")
+_os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+_os.environ.setdefault("MKL_NUM_THREADS", "1")
 import json
 from typing import Optional
 
@@ -12,11 +12,11 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import torch
-    try:
-        torch.set_num_threads(1)
-        torch.set_num_interop_threads(1)
-    except Exception:
-        pass
+try:
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+except Exception:
+    pass
 import h5py
 import matplotlib.pyplot as plt
 from PIL import Image
