@@ -1,7 +1,10 @@
 # File: project/streamlit_app.py
 from __future__ import annotations
 import io
-import os
+import os as _os
+    _os.environ.setdefault("OMP_NUM_THREADS", "1")
+    _os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    _os.environ.setdefault("MKL_NUM_THREADS", "1")
 import json
 from typing import Optional
 
@@ -9,6 +12,11 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import torch
+    try:
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
 import h5py
 import matplotlib.pyplot as plt
 from PIL import Image
@@ -274,15 +282,16 @@ def predict_on_pil(
     pil: Image.Image,
     x_tab: Optional[np.ndarray],
     threshold: float = 0.5,
+    show_cam: bool = False,
 ):
     """
     kind: "mm" (multimodal) or "img" (image-only)
-    Returns: pred (int), prob (float), cam (np.ndarray)
+    Returns: pred (int), prob (float), cam (np.ndarray or None)
     """
     tfms = _transforms(train=False)
     x = tfms(pil).unsqueeze(0)  # CPU is fine in Streamlit
 
-    # Forward
+    xt = None
     if kind == "mm":
         if x_tab is None:
             ct = load_tab_transformer()
@@ -291,49 +300,59 @@ def predict_on_pil(
             df1 = pd.DataFrame([{c: np.nan for c in (TAB_NUM + TAB_CAT)}])
             x_tab = ct.transform(df1)
         xt = torch.tensor(x_tab, dtype=torch.float32)
-        with torch.no_grad():
+
+    # Fast forward pass
+    with torch.inference_mode():
+        if kind == "mm":
             logit = model(x, xt).squeeze(1)
-    else:
-        with torch.no_grad():
+        else:
             logit = model(x).squeeze(1)
 
     prob = torch.sigmoid(logit).item()
     pred = int(prob >= threshold)
 
-    # Grad-CAM
-    if kind == "mm":
-        try:
-            gc = GradCAM(model, target_layer="backbone.layer4", forward_fn=lambda t: model(t, xt))
-        except KeyError:
-            gc = GradCAM(model, target_layer="layer4", forward_fn=lambda t: model(t, xt))
-    else:
-        gc = GradCAM(model, target_layer="layer4")
+    # Optional Grad-CAM (slow on CPU)
+    cam = None
+    if show_cam:
+        if kind == "mm":
+            # try backbone.layer4 first; fall back to layer4 for image-only blocks
+            try:
+                gc = GradCAM(model, target_layer="backbone.layer4", forward_fn=lambda t: model(t, xt))
+            except KeyError:
+                gc = GradCAM(model, target_layer="layer4", forward_fn=lambda t: model(t, xt))
+        else:
+            gc = GradCAM(model, target_layer="layer4")
+        cam = gc(x, class_idx=pred)
 
-    cam = gc(x, class_idx=pred)
     return pred, prob, cam
+
 
 def infer_and_show(
     model, kind: str, pil: Image.Image, x_tab: Optional[np.ndarray],
     threshold: float, meta_row: Optional[pd.Series] = None
 ):
-    pred, prob, cam = predict_on_pil(model, kind, pil, x_tab, threshold)
+    show_cam = st.session_state.get("show_cam", False)
+    pred, prob, cam = predict_on_pil(model, kind, pil, x_tab, threshold, show_cam=show_cam)
     over = overlay_cam(pil, cam) if cam is not None else None
 
     st.subheader("Case Inspection")
     cols = st.columns(3)
-    cols[0].image(pil, caption="Original", use_container_width=True)
-    with cols[1]:
-        if cam is not None:
+
+    # NOTE: Streamlit now prefers width='stretch' over use_container_width
+    cols[0].image(pil, caption="Original", width="stretch")
+
+    if show_cam and cam is not None:
+        with cols[1]:
             fig, ax = plt.subplots()
             ax.imshow(cam, cmap="jet"); ax.axis("off"); ax.set_title("Grad-CAM")
             st.pyplot(fig, clear_figure=True)
-    with cols[2]:
-        if over is not None:
-            cols[2].image(
-                over,
-                caption=f"Overlay | p(malig)={prob:.2f} | decision={'M' if pred else 'B'}",
-                use_container_width=True,
-            )
+
+    if over is not None:
+        cols[2].image(
+            over,
+            caption=f"Overlay | p(malig)={prob:.2f} | decision={'M' if pred else 'B'}",
+            width="stretch",
+        )
 
     rec = triage_recommendation(prob, threshold=threshold, margin=0.10)
     st.markdown(f"**Recommendation:** {rec}")
@@ -341,9 +360,9 @@ def infer_and_show(
     if meta_row is not None:
         st.markdown("**Metadata (redacted)**")
         meta_df = pd.DataFrame(meta_row.dropna())
-        # Ensure non-numeric values are strings for Arrow
         meta_df = meta_df.applymap(lambda v: v if isinstance(v, (int, float, np.number)) else str(v))
-        st.dataframe(meta_df, use_container_width=True)
+        st.dataframe(meta_df, use_container_width=True)  # table perf is fine
+
 
 def _get_feature_names(ct):
     """Return a list of current feature names from a fitted ColumnTransformer (if available)."""
@@ -421,6 +440,15 @@ uploaded = st.sidebar.file_uploader(
 )
 if uploaded is None:
     st.sidebar.caption("…or browse the dataset below.")
+
+# Make Grad-CAM optional (off by default — much faster)
+st.sidebar.toggle(
+    "Show Grad-CAM explanation (slower on CPU)",
+    value=False,
+    key="show_cam",
+    help="Turn on to see the heatmap. Off = much faster."
+)
+
 
 threshold = st.sidebar.slider(
     "Decision Threshold (malignant)",
