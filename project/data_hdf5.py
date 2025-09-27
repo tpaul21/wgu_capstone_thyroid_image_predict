@@ -17,7 +17,7 @@ from project.config import (
 )
 
 
-from project.features import fit_transform_all, transform_all
+from project.features import transform_all
 
 # ----------------- image helpers -----------------
 def _percentile_normalize(arr: np.ndarray, lo=1.0, hi=99.0) -> np.ndarray:
