@@ -485,7 +485,7 @@ with tab_overview:
 with tab_performance:
     st.info("Evaluates the current checkpoint on the current test split (streamed from HDF5).")
 
-    # Model & threshold info panel (inside this tab)
+    # --- Model & threshold info -------------------------------------------------
     kind_used, ckpt_path = get_active_checkpoint_info()
     with st.expander("Model & threshold info", expanded=True):
         st.markdown(f"**Model kind:** {'Multimodal' if kind_used=='mm' else ('Image-only' if kind_used=='img' else 'Not found')}")
@@ -499,14 +499,13 @@ with tab_performance:
             f"**Source:** {st.session_state.get('threshold_source', 'unknown')}"
         )
 
-    col_run, col_apply = st.columns([1,1])
-
+    col_run, col_apply = st.columns([1, 1])
     if col_run.button("Compute / Refresh Performance"):
         st.cache_data.clear()
         st.cache_resource.clear()
         st.rerun()
 
-    # ---- Load model -------------------------------------------------------------
+    # --- Load model / detect dim mismatch --------------------------------------
     res = load_model_and_kind()
     if res.get("status") == "ok":
         model, kind, tab_dim_from_ckpt = res["model"], res["kind"], res["tab_dim"]
@@ -517,9 +516,9 @@ with tab_performance:
             f"{res['ct_dim']} features, but checkpoint expects {res['ckpt_dim']}."
         )
         st.caption(
-            "This usually means the saved transformer does not match the checkpoint. "
-            "Ensure OUT_DIR contains the matching `tab_transformer.joblib` and "
-            "`tab_feature_names.json` that were saved with this checkpoint."
+            "This means the *committed* transformer doesn't match the checkpoint. "
+            "Commit the matching pair: `outputs/tab_transformer.joblib` and "
+            "`outputs/tab_feature_names.json` from the same training run."
         )
         st.write(f"**Checkpoint:** `{os.path.basename(res['ckpt_path'])}`")
         st.write(f"**Transformer:** `{os.path.basename(res['ct_path'])}`")
@@ -541,61 +540,43 @@ with tab_performance:
 
         if "model" not in locals():
             st.stop()
-
     else:
         st.warning("No trained checkpoints found. Train a model first: `python -m project.train_hdf5_mm`.")
         st.stop()
 
-    
-    # ---- Prepare the EXACT transformer used for the checkpoint -----------------
+    # --- Prepare EXACT transformer used for the checkpoint ----------------------
     ct_saved = None
     if kind == "mm":
         ct_saved = load_tab_transformer()
         if ct_saved is None:
-            st.error(
-                "Multimodal checkpoint detected, but `outputs/tab_transformer.joblib` "
-                "was not found. Please commit that file (and `tab_feature_names.json`) "
-                "from the same training run as this checkpoint."
-            )
+            st.error("Multimodal checkpoint detected, but `outputs/tab_transformer.joblib` is missing.")
             st.stop()
-    
-        # 1) Measure raw CT dim
+
         dummy = pd.DataFrame([{c: np.nan for c in (TAB_NUM + TAB_CAT)}])
         try:
             ct_dim_raw = int(ct_saved.transform(dummy).shape[1])
         except Exception as e:
-            st.error("The saved transformer failed on a dummy row; it likely doesn't match your current features.")
-            st.exception(e)
-            st.stop()
-    
-        # 2) If we have expected names, align order/width to match them
+            st.error("Saved transformer failed to transform a dummy row.")
+            st.exception(e); st.stop()
+
         exp_names = _load_expected_feature_names() or []
         cur_names = _get_feature_names(ct_saved)
         needs_align = bool(exp_names) and (cur_names is None or exp_names != list(cur_names))
-    
         if needs_align:
             ct_saved = _FeatureAligner(ct_saved, expected_names=exp_names, current_names=cur_names or [])
             try:
                 ct_dim_aligned = int(ct_saved.transform(dummy).shape[1])
             except Exception as e:
-                st.error("Feature alignment wrapper failed to transform a dummy row.")
-                st.exception(e)
-                st.stop()
+                st.error("Feature alignment wrapper failed.")
+                st.exception(e); st.stop()
         else:
             ct_dim_aligned = ct_dim_raw
-    
-        # 3) Hard check vs checkpoint expectation
+
         if ct_dim_aligned != tab_dim_from_ckpt:
             st.error(
-                f"Tabular feature width from transformer ({ct_dim_aligned}) does not match "
-                f"checkpoint expectation ({tab_dim_from_ckpt})."
+                f"Transformer width {ct_dim_aligned} != ckpt expected {tab_dim_from_ckpt}. "
+                "Commit the matching `tab_transformer.joblib` + `tab_feature_names.json`."
             )
-            st.caption(
-                "This means the committed transformer/feature-name list doesn't correspond to the checkpoint. "
-                "Commit the exact pair from training: `outputs/tab_transformer.joblib` and "
-                "`outputs/tab_feature_names.json` that were produced together with this checkpoint."
-            )
-            # Offer a safe fallback so you can still see plots
             if st.button("Use image-only fallback for Performance only"):
                 img_ckpt = OUT_DIR / "best_resnet18_hdf5.ckpt"
                 if img_ckpt.exists():
@@ -610,163 +591,44 @@ with tab_performance:
             else:
                 st.stop()
 
-# ---- Build loaders using the chosen transformer (or None for image-only) ----
-# ---- Prepare the EXACT transformer used for the checkpoint -----------------
-ct_saved = None
-if kind == "mm":
-    ct_saved = load_tab_transformer()
-    if ct_saved is None:
-        st.error(
-            "Multimodal checkpoint detected, but `outputs/tab_transformer.joblib` "
-            "was not found. Please commit that file (and `tab_feature_names.json`) "
-            "from the same training run as this checkpoint."
-        )
-        st.stop()
-
-    # 1) Measure raw CT dim
-    dummy = pd.DataFrame([{c: np.nan for c in (TAB_NUM + TAB_CAT)}])
-    try:
-        ct_dim_raw = int(ct_saved.transform(dummy).shape[1])
-    except Exception as e:
-        st.error("The saved transformer failed on a dummy row; it likely doesn't match your current features.")
-        st.exception(e)
-        st.stop()
-
-    # 2) If we have expected names, align order/width to match them
-    exp_names = _load_expected_feature_names() or []
-    cur_names = _get_feature_names(ct_saved)
-    needs_align = bool(exp_names) and (cur_names is None or exp_names != list(cur_names))
-
-    if needs_align:
-        ct_saved = _FeatureAligner(ct_saved, expected_names=exp_names, current_names=cur_names or [])
-        try:
-            ct_dim_aligned = int(ct_saved.transform(dummy).shape[1])
-        except Exception as e:
-            st.error("Feature alignment wrapper failed to transform a dummy row.")
-            st.exception(e)
-            st.stop()
-    else:
-        ct_dim_aligned = ct_dim_raw
-
-    # 3) Hard check vs checkpoint expectation
-    if ct_dim_aligned != tab_dim_from_ckpt:
-        st.error(
-            f"Tabular feature width from transformer ({ct_dim_aligned}) does not match "
-            f"checkpoint expectation ({tab_dim_from_ckpt})."
-        )
-        st.caption(
-            "This means the committed transformer/feature-name list doesn't correspond to the checkpoint. "
-            "Commit the exact pair from training: `outputs/tab_transformer.joblib` and "
-            "`outputs/tab_feature_names.json` that were produced together with this checkpoint."
-        )
-        # Offer a safe fallback so you can still see plots
-        if st.button("Use image-only fallback for Performance only"):
-            img_ckpt = OUT_DIR / "best_resnet18_hdf5.ckpt"
-            if img_ckpt.exists():
-                m = build_resnet18()
-                m.load_state_dict(torch.load(img_ckpt, map_location="cpu"))
-                m.eval()
-                model, kind, tab_dim_from_ckpt, ct_saved = m, "img", 0, None
-                st.success("Switched to image-only for this session.")
-            else:
-                st.warning("Image-only checkpoint not found.")
-                st.stop()
-        else:
-            st.stop()
-
-# ---- Build loaders using the chosen transformer (or None for image-only) ----
-try:
-    # IMPORTANT: pass the training knobs from config.py so Cloud matches your training run
-    train_dl, val_dl, test_dl, _, _, tab_dim_from_loader = make_splits_and_loaders_mm(
-        batch_size=16,
-        seed=SEED,
-        subset_groups_frac=SUBSET_GROUPS_FRAC,
-        subset_groups_max=SUBSET_GROUPS_MAX,
-        frame_stride=FRAME_STRIDE,
-        max_frames_per_group=MAX_FRAMES_PER_GROUP,
-        samples_per_epoch=SAMPLES_PER_EPOCH,
-        ct=ct_saved,   # None if image-only; exact/aligned CT if multimodal
-    )
-
-    if kind == "mm" and tab_dim_from_loader != tab_dim_from_ckpt:
-        st.error(
-            f"Loader produced tab width {tab_dim_from_loader}, but checkpoint expects {tab_dim_from_ckpt}. "
-            "This indicates a transformer / feature-name mismatch. Please commit the correct "
-            "`tab_transformer.joblib` + `tab_feature_names.json` pair for this checkpoint."
-        )
-        st.stop()
-
-    # Small diagnostic so you can see the evaluated split sizes & tab width
-    st.caption(
-        f"Eval split (frame-level): train={len(train_dl.dataset)}, "
-        f"val={len(val_dl.dataset)}, test={len(test_dl.dataset)} frames • "
-        f"tab_dim={tab_dim_from_loader}"
-    )
-
-except RuntimeError as e:
-    st.error(
-        "Failed preparing evaluation loaders due to a shape mismatch while applying the tabular transformer."
-    )
-    st.exception(e)
-    st.caption(
-        "Fix by committing the exact pair from training: "
-        "`outputs/tab_transformer.joblib` and `outputs/tab_feature_names.json`."
-    )
-    st.stop()
-
-
-except RuntimeError as e:
-    st.error(
-        "Failed preparing evaluation loaders due to a shape mismatch while applying the tabular transformer."
-    )
-    st.exception(e)
-    st.caption(
-        "Fix by committing the exact pair from training: "
-        "`outputs/tab_transformer.joblib` and `outputs/tab_feature_names.json`."
-    )
-    st.stop()
-
-
-    # ---- Build loaders using the chosen transformer (or None for image-only) ----
+    # --- Build loaders (pass knobs from config.py so Cloud matches training) ----
     try:
         train_dl, val_dl, test_dl, _, _, tab_dim_from_loader = make_splits_and_loaders_mm(
             batch_size=16,
-            ct=ct_saved,   # None if image-only; exact/aligned CT if multimodal
+            seed=SEED,
+            subset_groups_frac=SUBSET_GROUPS_FRAC,
+            subset_groups_max=SUBSET_GROUPS_MAX,
+            frame_stride=FRAME_STRIDE,
+            max_frames_per_group=MAX_FRAMES_PER_GROUP,
+            samples_per_epoch=SAMPLES_PER_EPOCH,
+            ct=ct_saved,
         )
-
         if kind == "mm" and tab_dim_from_loader != tab_dim_from_ckpt:
             st.error(
-                f"Loader produced tab width {tab_dim_from_loader}, but checkpoint expects {tab_dim_from_ckpt}. "
-                "This indicates a transformer / feature-name mismatch. Please commit the correct "
-                "`tab_transformer.joblib` + `tab_feature_names.json` pair for this checkpoint."
+                f"Loader produced tab width {tab_dim_from_loader}, but checkpoint expects {tab_dim_from_ckpt}."
             )
             st.stop()
 
-    except RuntimeError as e:
-        st.error(
-            "Failed preparing evaluation loaders due to a shape mismatch while applying the tabular transformer."
-        )
-        st.exception(e)
         st.caption(
-            "Fix by committing the exact pair from training: "
-            "`outputs/tab_transformer.joblib` and `outputs/tab_feature_names.json`."
+            f"Eval split (frame-level): train={len(train_dl.dataset)}, "
+            f"val={len(val_dl.dataset)}, test={len(test_dl.dataset)} frames • "
+            f"tab_dim={tab_dim_from_loader}"
         )
-        st.stop()
+    except RuntimeError as e:
+        st.error("Failed preparing loaders due to a tabular shape mismatch.")
+        st.exception(e); st.stop()
 
-    # ---- Build pos_weight and criterion (unchanged) ------------------------------
+    # --- Build loss with pos_weight from the *train* split ----------------------
     ys = []
     for batch in train_dl:
-        y = batch[-1]
+        y = batch[-1]  # last element is labels for both 2- or 3-tuple batches
         ys.append(y.numpy())
     y_concat = np.concatenate(ys) if ys else np.array([0, 1])
     pos, neg = int(y_concat.sum()), int((1 - y_concat).sum())
     criterion = make_criterion(pos, neg, device=torch.device("cpu"))
 
-    # ---- Evaluate ----------------------------------------------------------------
+    # --- Evaluate & render ------------------------------------------------------
     metrics = evaluate(model, test_dl, criterion, torch.device("cpu"))
-
-
-        
 
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Accuracy", f"{metrics['acc']:.3f}")
@@ -774,39 +636,21 @@ except RuntimeError as e:
     k3.metric("Recall", f"{metrics['recall']:.3f}")
     k4.metric("F1", f"{metrics['f1']:.3f}")
 
-    # Confusion + ROC
     figs = plot_confusion_and_roc(metrics["y_true"], metrics["y_prob"], metrics["y_pred"])
     for fig in figs:
         st.pyplot(fig, clear_figure=True)
 
-    # PR + Calibration + Brier score
     from sklearn.metrics import brier_score_loss
     for fig in plot_pr_and_calibration(metrics["y_true"], metrics["y_prob"]):
         st.pyplot(fig, clear_figure=True)
     st.caption(f"Brier score: {brier_score_loss(metrics['y_true'], metrics['y_prob']):.4f}")
 
-    # --- Training curves from history (if available) ---
-    hist_path = OUT_DIR / "train_history.jsonl"
-    if hist_path.exists():
-        try:
-            dfh = pd.read_json(hist_path, lines=True)
-            if {"epoch","train_loss","val_loss"}.issubset(dfh.columns):
-                st.subheader("Training Curves")
-                c1, c2 = st.columns(2)
-                c1.line_chart(dfh.set_index("epoch")[["train_loss","val_loss"]])
-                if {"train_acc","val_acc"}.issubset(dfh.columns):
-                    c2.line_chart(dfh.set_index("epoch")[["train_acc","val_acc"]])
-        except Exception as e:
-            st.caption(f"Could not load train history: {e}")
-
-    # --- Nodule-level metrics & val-tuned threshold ---
+    # --- Nodule-level metrics & apply button -----------------------------------
     st.subheader("Nodule-level evaluation")
     npath = OUT_DIR / "eval_nodule_summary.json"
     if npath.exists():
         try:
             nsum = _read_json(npath)
-
-            # Display either the newer val/test schema or the older best_F1
             thr_val = None
             if "thr_val_bestF1" in nsum:
                 thr_val = float(nsum["thr_val_bestF1"])
@@ -828,10 +672,8 @@ except RuntimeError as e:
                 tcols[2].metric("Rec", f"{tb.get('recall', float('nan')):.3f}")
                 tcols[3].metric("F1", f"{tb.get('f1', float('nan')):.3f}")
                 tcols[4].metric("AUC", f"{tb.get('auc', float('nan')):.3f}")
-
             elif "best_F1" in nsum:
-                best = nsum["best_F1"]
-                thr_val = float(best.get("threshold", 0.5))
+                best = nsum["best_F1"]; thr_val = float(best.get("threshold", 0.5))
                 cols = st.columns(5)
                 cols[0].metric("Acc", f"{best.get('acc', float('nan')):.3f}")
                 cols[1].metric("Prec", f"{best.get('precision', float('nan')):.3f}")
@@ -840,7 +682,6 @@ except RuntimeError as e:
                 cols[4].metric("AUC", f"{best.get('auc', float('nan')):.3f}")
                 st.caption(f"Best-F1 threshold (nodule): **{thr_val:.4f}**")
 
-            # Apply button → updates the sidebar slider immediately and records source
             if thr_val is not None and col_apply.button("Apply val-tuned nodule threshold to Case Explorer"):
                 st.session_state["threshold_value"] = float(thr_val)
                 st.session_state["threshold_source"] = "nodule val-tuned (eval_nodule_summary.json)" \
@@ -850,6 +691,7 @@ except RuntimeError as e:
             st.caption(f"Nodule summary not available: {e}")
     else:
         st.caption("Run the post-hoc nodule evaluation cell to generate eval_nodule_summary.json.")
+
 
 with tab_case:
     res = load_model_and_kind()
